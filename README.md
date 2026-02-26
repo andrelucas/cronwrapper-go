@@ -1,8 +1,6 @@
 # cronwrapper
 
-`cronwrapper` wraps a command, captures combined `stdout`/`stderr` to a file, and emails the output with a configurable subject line.
-
-This mirrors the purpose of `cronwrapper.py`: keep control over email subjects (for success/failure filtering) while still receiving command output.
+`cronwrapper` wraps a command, captures combined `stdout`/`stderr` to a file, and emails the output with a configurable subject line. By default, the subject line starts with 'SUCCESS' or 'FAILURE' based on the exit code of the command, making it easy to create mail filters while still delivering command output.
 
 ## Build
 
@@ -80,6 +78,7 @@ cronwrapper -to you@example.com -noshell /usr/bin/env printf 'hello\n'
 - `-mailer-test`
   - Send a test message using the selected mailer and exit without executing the wrapped command.
   - Useful for validating transport/auth/certificate settings safely.
+  - For SMTP, diagnostics include effective username and whether password is set, plus password source (`environment` vs command line), without exposing the secret.
 - `-timestamp` (default `true`)
   - Include start/end timestamps in mail header.
 - `-notimestamp`
@@ -100,7 +99,7 @@ cronwrapper -to you@example.com -noshell /usr/bin/env printf 'hello\n'
   - Path to `mailx` executable (used when `-mailer mailx`).
 - `-smtp-addr string` (default `127.0.0.1:25`)
   - SMTP server address (`host:port`) used when `-mailer smtp`.
-- `-smtp-security string` (default `none`)
+- `-smtp-security string` (default `starttls`)
   - SMTP transport security: `none`, `starttls`, or `tls`.
 - `-smtp-server-name string`
   - TLS server name override (default: host from `-smtp-addr`).
@@ -113,13 +112,14 @@ cronwrapper -to you@example.com -noshell /usr/bin/env printf 'hello\n'
 - `-smtp-client-key string`
   - Client key PEM for mutual TLS.
 - `-smtp-username string`
-  - SMTP SASL username.
+  - SMTP SASL username. If omitted but a password is provided, defaults to the resolved `-from` value.
 - `-smtp-password string`
   - SMTP SASL password. Strongly discouraged because command-line args are visible in process lists.
 - `-smtp-password-env string` (default `CRONWRAPPER_SMTP_PASSWORD`)
   - Environment variable holding SMTP SASL password.
 - `-from string`
   - SMTP envelope/header sender (default `$LOGNAME@hostname`) when `-mailer smtp`.
+  - Also used as default SMTP username when a password is provided without `-smtp-username`.
 - `-debug`
   - Print debug info to `stderr`.
 

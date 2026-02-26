@@ -48,6 +48,14 @@ type subjectData struct {
 	Code    int
 }
 
+type smtpResolvedConfig struct {
+	From           string
+	Username       string
+	Password       string
+	UsernameSource string
+	PasswordSource string
+}
+
 func parseFlags(args []string) (options, []string, error) {
 	opt := options{
 		timestamp:       true,
@@ -71,7 +79,7 @@ func parseFlags(args []string) (options, []string, error) {
 	fs.StringVar(&opt.mailer, "mailer", "mailx", "mail backend: mailx or smtp")
 	fs.StringVar(&opt.mailxPath, "mailx-path", "mailx", "mailx executable path")
 	fs.StringVar(&opt.smtpAddr, "smtp-addr", "127.0.0.1:25", "SMTP server address in host:port form")
-	fs.StringVar(&opt.smtpSecurity, "smtp-security", "none", "SMTP transport security: none, starttls, or tls")
+	fs.StringVar(&opt.smtpSecurity, "smtp-security", "starttls", "SMTP transport security: none, starttls, or tls")
 	fs.StringVar(&opt.smtpServerName, "smtp-server-name", "", "TLS server name override (default: host from -smtp-addr)")
 	fs.BoolVar(&opt.smtpInsecureTLS, "smtp-insecure-skip-verify", false, "skip TLS certificate verification (discouraged)")
 	fs.StringVar(&opt.smtpCACert, "smtp-ca-cert", "", "PEM file containing additional trusted CA certificates")
@@ -277,8 +285,19 @@ func mailerTestBody(opt options) string {
 	if strings.EqualFold(opt.mailer, "smtp") {
 		b.WriteString(fmt.Sprintf("smtp addr: %s\n", opt.smtpAddr))
 		b.WriteString(fmt.Sprintf("smtp security: %s\n", strings.ToLower(opt.smtpSecurity)))
-		if opt.smtpUsername != "" {
-			b.WriteString(fmt.Sprintf("smtp username: %s\n", opt.smtpUsername))
+		resolved, err := resolveSMTPConfig(opt)
+		if err != nil {
+			b.WriteString(fmt.Sprintf("smtp resolution error: %v\n", err))
+		} else {
+			b.WriteString(fmt.Sprintf("smtp from: %s\n", resolved.From))
+			b.WriteString(fmt.Sprintf("smtp username: %s\n", resolved.Username))
+			b.WriteString(fmt.Sprintf("smtp username source: %s\n", resolved.UsernameSource))
+			if resolved.Password != "" {
+				b.WriteString("smtp password set: yes\n")
+			} else {
+				b.WriteString("smtp password set: no\n")
+			}
+			b.WriteString(fmt.Sprintf("smtp password source: %s\n", resolved.PasswordSource))
 		}
 	}
 	b.WriteString("note: no wrapped command was executed; this was a mailer-only test.\n")
@@ -293,28 +312,9 @@ func newMailer(opt options) (Mailer, error) {
 		if opt.smtpPassword != "" {
 			fmt.Fprintln(os.Stderr, "warning: -smtp-password is visible to other users via process lists; prefer -smtp-password-env")
 		}
-
-		smtpPassword := ""
-		if opt.smtpPasswordEnv != "" {
-			smtpPassword = os.Getenv(opt.smtpPasswordEnv)
-		}
-		if opt.smtpPassword != "" {
-			smtpPassword = opt.smtpPassword
-		}
-		if opt.smtpUsername != "" && smtpPassword == "" {
-			return nil, fmt.Errorf("SMTP auth requested via -smtp-username but no password found; set -smtp-password-env or -smtp-password")
-		}
-		if opt.smtpUsername == "" && smtpPassword != "" {
-			return nil, fmt.Errorf("SMTP password provided without -smtp-username")
-		}
-
-		fromAddr := opt.from
-		if fromAddr == "" {
-			login := os.Getenv("LOGNAME")
-			if login == "" {
-				login = "cronwrapper"
-			}
-			fromAddr = fmt.Sprintf("%s@%s", login, shortHostname())
+		resolved, err := resolveSMTPConfig(opt)
+		if err != nil {
+			return nil, err
 		}
 
 		return SMTPMailer{
@@ -326,12 +326,59 @@ func newMailer(opt options) (Mailer, error) {
 				CACertFile:         opt.smtpCACert,
 				ClientCertFile:     opt.smtpClientCert,
 				ClientKeyFile:      opt.smtpClientKey,
-				Username:           opt.smtpUsername,
-				Password:           smtpPassword,
-				From:               fromAddr,
+				Username:           resolved.Username,
+				Password:           resolved.Password,
+				From:               resolved.From,
 			},
 		}, nil
 	default:
 		return nil, fmt.Errorf("invalid -mailer %q (expected mailx or smtp)", opt.mailer)
 	}
+}
+
+func resolveSMTPConfig(opt options) (smtpResolvedConfig, error) {
+	fromAddr := opt.from
+	if fromAddr == "" {
+		login := os.Getenv("LOGNAME")
+		if login == "" {
+			login = "cronwrapper"
+		}
+		fromAddr = fmt.Sprintf("%s@%s", login, shortHostname())
+	}
+
+	password := ""
+	passwordSource := "not set"
+	if opt.smtpPasswordEnv != "" {
+		envPassword := os.Getenv(opt.smtpPasswordEnv)
+		if envPassword != "" {
+			password = envPassword
+			passwordSource = fmt.Sprintf("environment (%s)", opt.smtpPasswordEnv)
+		}
+	}
+	if opt.smtpPassword != "" {
+		password = opt.smtpPassword
+		passwordSource = "command line (-smtp-password)"
+	}
+
+	username := opt.smtpUsername
+	usernameSource := "explicit (-smtp-username)"
+	if username == "" && password != "" {
+		username = fromAddr
+		usernameSource = "inferred from -from/effective sender"
+	}
+	if username == "" {
+		usernameSource = "not set"
+	}
+
+	if username != "" && password == "" {
+		return smtpResolvedConfig{}, fmt.Errorf("SMTP auth requested via -smtp-username but no password found; set -smtp-password-env or -smtp-password")
+	}
+
+	return smtpResolvedConfig{
+		From:           fromAddr,
+		Username:       username,
+		Password:       password,
+		UsernameSource: usernameSource,
+		PasswordSource: passwordSource,
+	}, nil
 }
