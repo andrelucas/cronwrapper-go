@@ -35,10 +35,24 @@ If you publish under a different GitHub path, update `module` in `go.mod` and us
 cronwrapper [flags] command [args...]
 ```
 
+`command [args...]` is required unless `-mailer-test` is set.
+
 Common pattern (shell mode, default):
 
 ```bash
 cronwrapper -to you@example.com 'echo out; echo err >&2'
+```
+
+Use SMTP backend explicitly:
+
+```bash
+cronwrapper -mailer smtp -smtp-addr smtp.example.com:587 -smtp-security starttls -smtp-username myuser -to you@example.com 'your command'
+```
+
+Test mailer configuration without running any command:
+
+```bash
+cronwrapper -mailer smtp -smtp-addr smtp.example.com:587 -smtp-security starttls -smtp-username myuser -to you@example.com -mailer-test
 ```
 
 ### Important command-passing behavior
@@ -63,6 +77,9 @@ cronwrapper -to you@example.com -noshell /usr/bin/env printf 'hello\n'
   - Email recipient. Defaults to `$LOGNAME`.
 - `-noshell`
   - Run command directly instead of via `/bin/sh -c`.
+- `-mailer-test`
+  - Send a test message using the selected mailer and exit without executing the wrapped command.
+  - Useful for validating transport/auth/certificate settings safely.
 - `-timestamp` (default `true`)
   - Include start/end timestamps in mail header.
 - `-notimestamp`
@@ -77,8 +94,32 @@ cronwrapper -to you@example.com -noshell /usr/bin/env printf 'hello\n'
   - Path to capture file. If omitted, a temp file is used.
 - `-keep-output`
   - Keep temp capture file instead of deleting it.
+- `-mailer string` (default `mailx`)
+  - Mail backend: `mailx` or `smtp`.
 - `-mailx-path string` (default `mailx`)
-  - Path to `mailx` executable.
+  - Path to `mailx` executable (used when `-mailer mailx`).
+- `-smtp-addr string` (default `127.0.0.1:25`)
+  - SMTP server address (`host:port`) used when `-mailer smtp`.
+- `-smtp-security string` (default `none`)
+  - SMTP transport security: `none`, `starttls`, or `tls`.
+- `-smtp-server-name string`
+  - TLS server name override (default: host from `-smtp-addr`).
+- `-smtp-insecure-skip-verify`
+  - Skip TLS certificate verification (discouraged).
+- `-smtp-ca-cert string`
+  - PEM file containing additional trusted CA certificates.
+- `-smtp-client-cert string`
+  - Client certificate PEM for mutual TLS.
+- `-smtp-client-key string`
+  - Client key PEM for mutual TLS.
+- `-smtp-username string`
+  - SMTP SASL username.
+- `-smtp-password string`
+  - SMTP SASL password. Strongly discouraged because command-line args are visible in process lists.
+- `-smtp-password-env string` (default `CRONWRAPPER_SMTP_PASSWORD`)
+  - Environment variable holding SMTP SASL password.
+- `-from string`
+  - SMTP envelope/header sender (default `$LOGNAME@hostname`) when `-mailer smtp`.
 - `-debug`
   - Print debug info to `stderr`.
 
@@ -96,5 +137,9 @@ cronwrapper -to you@example.com -noshell /usr/bin/env printf 'hello\n'
 
 ## Mail backend
 
-Mail sending is abstracted via a `Mailer` interface (`cmd/cronwrapper/mailer.go`), with current implementation using `mailx`.
-This makes it straightforward to add another transport later (for example `sendmail` or SMTP).
+Mail sending is abstracted via a `Mailer` interface in `cmd/cronwrapper/mailer.go`.
+
+- `mailx` backend (default): local `mailx` binary.
+- `smtp` backend: direct SMTP delivery via `github.com/emersion/go-smtp` and SASL auth via `github.com/emersion/go-sasl`.
+
+For SMTP auth, prefer setting `CRONWRAPPER_SMTP_PASSWORD` (or your configured `-smtp-password-env` variable) instead of using `-smtp-password` on the command line.

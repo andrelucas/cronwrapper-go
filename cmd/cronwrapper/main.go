@@ -18,13 +18,26 @@ import (
 type options struct {
 	to              string
 	noshell         bool
+	mailerTest      bool
 	timestamp       bool
 	notimestamp     bool
 	subject         string
 	subjectTemplate string
 	outputPath      string
 	keepOutput      bool
+	mailer          string
 	mailxPath       string
+	smtpAddr        string
+	smtpSecurity    string
+	smtpServerName  string
+	smtpInsecureTLS bool
+	smtpCACert      string
+	smtpClientCert  string
+	smtpClientKey   string
+	smtpUsername    string
+	smtpPassword    string
+	smtpPasswordEnv string
+	from            string
 	debug           bool
 }
 
@@ -47,6 +60,7 @@ func parseFlags(args []string) (options, []string, error) {
 
 	fs.StringVar(&opt.to, "to", "", "email recipient (default: $LOGNAME)")
 	fs.BoolVar(&opt.noshell, "noshell", false, "run command directly without a shell")
+	fs.BoolVar(&opt.mailerTest, "mailer-test", false, "send a test message using the selected mailer and exit without running the command")
 	fs.BoolVar(&opt.timestamp, "timestamp", true, "add start/end timestamps in header")
 	fs.BoolVar(&opt.notimestamp, "notimestamp", false, "disable timestamps in header")
 	fs.BoolVar(&opt.debug, "debug", false, "enable debug logging")
@@ -54,7 +68,19 @@ func parseFlags(args []string) (options, []string, error) {
 	fs.StringVar(&opt.subject, "subject", "", "explicit email subject (overrides -subject-template)")
 	fs.StringVar(&opt.subjectTemplate, "subject-template", opt.subjectTemplate, "Go template for subject: {{.Result}} {{.Host}} {{.Command}} {{.Code}}")
 	fs.StringVar(&opt.outputPath, "output", "", "capture file path (default: temp file)")
+	fs.StringVar(&opt.mailer, "mailer", "mailx", "mail backend: mailx or smtp")
 	fs.StringVar(&opt.mailxPath, "mailx-path", "mailx", "mailx executable path")
+	fs.StringVar(&opt.smtpAddr, "smtp-addr", "127.0.0.1:25", "SMTP server address in host:port form")
+	fs.StringVar(&opt.smtpSecurity, "smtp-security", "none", "SMTP transport security: none, starttls, or tls")
+	fs.StringVar(&opt.smtpServerName, "smtp-server-name", "", "TLS server name override (default: host from -smtp-addr)")
+	fs.BoolVar(&opt.smtpInsecureTLS, "smtp-insecure-skip-verify", false, "skip TLS certificate verification (discouraged)")
+	fs.StringVar(&opt.smtpCACert, "smtp-ca-cert", "", "PEM file containing additional trusted CA certificates")
+	fs.StringVar(&opt.smtpClientCert, "smtp-client-cert", "", "client certificate PEM file for mutual TLS")
+	fs.StringVar(&opt.smtpClientKey, "smtp-client-key", "", "client private key PEM file for mutual TLS")
+	fs.StringVar(&opt.smtpUsername, "smtp-username", "", "SMTP SASL username")
+	fs.StringVar(&opt.smtpPassword, "smtp-password", "", "SMTP SASL password (discouraged: prefer -smtp-password-env)")
+	fs.StringVar(&opt.smtpPasswordEnv, "smtp-password-env", "CRONWRAPPER_SMTP_PASSWORD", "env var containing SMTP SASL password")
+	fs.StringVar(&opt.from, "from", "", "SMTP envelope/header sender (default: $LOGNAME@hostname)")
 
 	if err := fs.Parse(args); err != nil {
 		return options{}, nil, fmt.Errorf("%v\n%s", err, strings.TrimSpace(parseErr.String()))
@@ -146,7 +172,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "usage: cronwrapper [flags] command [args...]")
 		os.Exit(2)
 	}
-	if len(cmdArgs) == 0 {
+	if len(cmdArgs) == 0 && !opt.mailerTest {
 		fmt.Fprintln(os.Stderr, "error: command is required")
 		fmt.Fprintln(os.Stderr, "usage: cronwrapper [flags] command [args...]")
 		os.Exit(2)
@@ -159,6 +185,29 @@ func main() {
 	if rcpt == "" {
 		fmt.Fprintln(os.Stderr, "error: recipient not set; use -to or set LOGNAME")
 		os.Exit(2)
+	}
+	mailer, err := newMailer(opt)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(2)
+	}
+	if opt.mailerTest {
+		if len(cmdArgs) > 0 {
+			fmt.Fprintln(os.Stderr, "warning: -mailer-test is set; command arguments are ignored and will not be executed")
+		}
+		subj := opt.subject
+		if subj == "" {
+			subj = fmt.Sprintf("TEST: %s: mailer=%s", shortHostname(), strings.ToLower(opt.mailer))
+		}
+		body := strings.NewReader(mailerTestBody(opt))
+		if err := mailer.Send(context.Background(), rcpt, subj, body); err != nil {
+			fmt.Fprintln(os.Stderr, "mailer test failed:", err)
+			os.Exit(1)
+		}
+		if opt.debug {
+			fmt.Fprintln(os.Stderr, "debug: mailer test message sent")
+		}
+		return
 	}
 
 	capturePath := opt.outputPath
@@ -209,7 +258,6 @@ func main() {
 
 	head := headerContent(opt.timestamp, start, end, exitCode)
 	body := io.MultiReader(strings.NewReader(head), captureFile)
-	mailer := MailxMailer{Path: opt.mailxPath}
 	if err := mailer.Send(context.Background(), rcpt, subj, body); err != nil {
 		fmt.Fprintln(os.Stderr, "email command failed:", err)
 		os.Exit(1)
@@ -217,5 +265,73 @@ func main() {
 
 	if opt.debug {
 		fmt.Fprintf(os.Stderr, "debug: command exit code=%d, output=%s\n", exitCode, capturePath)
+	}
+}
+
+func mailerTestBody(opt options) string {
+	var b strings.Builder
+	b.WriteString("cronwrapper mailer test\n")
+	b.WriteString(fmt.Sprintf("time: %s\n", time.Now().Format(time.RFC3339)))
+	b.WriteString(fmt.Sprintf("host: %s\n", shortHostname()))
+	b.WriteString(fmt.Sprintf("mailer: %s\n", strings.ToLower(opt.mailer)))
+	if strings.EqualFold(opt.mailer, "smtp") {
+		b.WriteString(fmt.Sprintf("smtp addr: %s\n", opt.smtpAddr))
+		b.WriteString(fmt.Sprintf("smtp security: %s\n", strings.ToLower(opt.smtpSecurity)))
+		if opt.smtpUsername != "" {
+			b.WriteString(fmt.Sprintf("smtp username: %s\n", opt.smtpUsername))
+		}
+	}
+	b.WriteString("note: no wrapped command was executed; this was a mailer-only test.\n")
+	return b.String()
+}
+
+func newMailer(opt options) (Mailer, error) {
+	switch strings.ToLower(opt.mailer) {
+	case "mailx":
+		return MailxMailer{Path: opt.mailxPath}, nil
+	case "smtp":
+		if opt.smtpPassword != "" {
+			fmt.Fprintln(os.Stderr, "warning: -smtp-password is visible to other users via process lists; prefer -smtp-password-env")
+		}
+
+		smtpPassword := ""
+		if opt.smtpPasswordEnv != "" {
+			smtpPassword = os.Getenv(opt.smtpPasswordEnv)
+		}
+		if opt.smtpPassword != "" {
+			smtpPassword = opt.smtpPassword
+		}
+		if opt.smtpUsername != "" && smtpPassword == "" {
+			return nil, fmt.Errorf("SMTP auth requested via -smtp-username but no password found; set -smtp-password-env or -smtp-password")
+		}
+		if opt.smtpUsername == "" && smtpPassword != "" {
+			return nil, fmt.Errorf("SMTP password provided without -smtp-username")
+		}
+
+		fromAddr := opt.from
+		if fromAddr == "" {
+			login := os.Getenv("LOGNAME")
+			if login == "" {
+				login = "cronwrapper"
+			}
+			fromAddr = fmt.Sprintf("%s@%s", login, shortHostname())
+		}
+
+		return SMTPMailer{
+			Config: SMTPConfig{
+				Addr:               opt.smtpAddr,
+				Security:           SMTPSecurityMode(opt.smtpSecurity),
+				ServerName:         opt.smtpServerName,
+				InsecureSkipVerify: opt.smtpInsecureTLS,
+				CACertFile:         opt.smtpCACert,
+				ClientCertFile:     opt.smtpClientCert,
+				ClientKeyFile:      opt.smtpClientKey,
+				Username:           opt.smtpUsername,
+				Password:           smtpPassword,
+				From:               fromAddr,
+			},
+		}, nil
+	default:
+		return nil, fmt.Errorf("invalid -mailer %q (expected mailx or smtp)", opt.mailer)
 	}
 }
