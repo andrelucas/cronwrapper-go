@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -54,6 +55,13 @@ type smtpResolvedConfig struct {
 	Password       string
 	UsernameSource string
 	PasswordSource string
+}
+
+func debugf(enabled bool, format string, args ...any) {
+	if !enabled {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "debug: "+format+"\n", args...)
 }
 
 func parseFlags(args []string) (options, []string, error) {
@@ -180,6 +188,16 @@ func main() {
 		fmt.Fprintln(os.Stderr, "usage: cronwrapper [flags] command [args...]")
 		os.Exit(2)
 	}
+	debugf(
+		opt.debug,
+		"startup mailer=%s mailer_test=%t noshell=%t timestamp=%t output_override=%t keep_output=%t",
+		strings.ToLower(opt.mailer),
+		opt.mailerTest,
+		opt.noshell,
+		opt.timestamp,
+		opt.outputPath != "",
+		opt.keepOutput,
+	)
 	if len(cmdArgs) == 0 && !opt.mailerTest {
 		fmt.Fprintln(os.Stderr, "error: command is required")
 		fmt.Fprintln(os.Stderr, "usage: cronwrapper [flags] command [args...]")
@@ -194,6 +212,8 @@ func main() {
 		fmt.Fprintln(os.Stderr, "error: recipient not set; use -to or set LOGNAME")
 		os.Exit(2)
 	}
+	debugf(opt.debug, "resolved recipient=%s", rcpt)
+
 	mailer, err := newMailer(opt)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -207,14 +227,13 @@ func main() {
 		if subj == "" {
 			subj = fmt.Sprintf("TEST: %s: mailer=%s", shortHostname(), strings.ToLower(opt.mailer))
 		}
+		debugf(opt.debug, "mailer-test sending to=%s subject=%q", rcpt, subj)
 		body := strings.NewReader(mailerTestBody(opt))
 		if err := mailer.Send(context.Background(), rcpt, subj, body); err != nil {
 			fmt.Fprintln(os.Stderr, "mailer test failed:", err)
 			os.Exit(1)
 		}
-		if opt.debug {
-			fmt.Fprintln(os.Stderr, "debug: mailer test message sent")
-		}
+		debugf(opt.debug, "mailer-test message sent successfully")
 		return
 	}
 
@@ -224,6 +243,7 @@ func main() {
 		capturePath = filepath.Join(os.TempDir(), fmt.Sprintf("cronwrapper-%d.out", time.Now().UnixNano()))
 		isTempCapture = true
 	}
+	debugf(opt.debug, "capture path=%s temp=%t keep_output=%t", capturePath, isTempCapture, opt.keepOutput)
 
 	captureFile, err := os.OpenFile(capturePath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
 	if err != nil {
@@ -236,12 +256,17 @@ func main() {
 	}
 
 	start := time.Now()
+	debugf(opt.debug, "running command shell=%t argv=%q", !opt.noshell, cmdArgs)
 	exitCode, err := runCommand(context.Background(), cmdArgs, !opt.noshell, captureFile)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error running command:", err)
 		os.Exit(1)
 	}
 	end := time.Now()
+	debugf(opt.debug, "command finished exit_code=%d duration=%s", exitCode, end.Sub(start))
+	if stat, err := captureFile.Stat(); err == nil {
+		debugf(opt.debug, "captured output bytes=%d", stat.Size())
+	}
 
 	if _, err := captureFile.Seek(0, io.SeekStart); err != nil {
 		fmt.Fprintln(os.Stderr, "error rewinding capture file:", err)
@@ -263,17 +288,16 @@ func main() {
 		fmt.Fprintln(os.Stderr, "error building subject:", err)
 		os.Exit(1)
 	}
+	debugf(opt.debug, "mail subject=%q result=%s", subj, result)
 
 	head := headerContent(opt.timestamp, start, end, exitCode)
 	body := io.MultiReader(strings.NewReader(head), captureFile)
+	debugf(opt.debug, "sending mail to=%s backend=%s", rcpt, strings.ToLower(opt.mailer))
 	if err := mailer.Send(context.Background(), rcpt, subj, body); err != nil {
 		fmt.Fprintln(os.Stderr, "email command failed:", err)
 		os.Exit(1)
 	}
-
-	if opt.debug {
-		fmt.Fprintf(os.Stderr, "debug: command exit code=%d, output=%s\n", exitCode, capturePath)
-	}
+	debugf(opt.debug, "mail sent successfully exit_code=%d output=%s", exitCode, capturePath)
 }
 
 func mailerTestBody(opt options) string {
@@ -285,6 +309,13 @@ func mailerTestBody(opt options) string {
 	if strings.EqualFold(opt.mailer, "smtp") {
 		b.WriteString(fmt.Sprintf("smtp addr: %s\n", opt.smtpAddr))
 		b.WriteString(fmt.Sprintf("smtp security: %s\n", strings.ToLower(opt.smtpSecurity)))
+		serverName, serverNameSource, err := resolveSMTPServerName(opt)
+		if err != nil {
+			b.WriteString(fmt.Sprintf("smtp starttls server name resolution error: %v\n", err))
+		} else {
+			b.WriteString(fmt.Sprintf("smtp starttls server name: %s\n", serverName))
+			b.WriteString(fmt.Sprintf("smtp starttls server name source: %s\n", serverNameSource))
+		}
 		resolved, err := resolveSMTPConfig(opt)
 		if err != nil {
 			b.WriteString(fmt.Sprintf("smtp resolution error: %v\n", err))
@@ -307,6 +338,11 @@ func mailerTestBody(opt options) string {
 func newMailer(opt options) (Mailer, error) {
 	switch strings.ToLower(opt.mailer) {
 	case "mailx":
+		path := opt.mailxPath
+		if path == "" {
+			path = "mailx"
+		}
+		debugf(opt.debug, "mailer backend=mailx path=%s", path)
 		return MailxMailer{Path: opt.mailxPath}, nil
 	case "smtp":
 		if opt.smtpPassword != "" {
@@ -316,6 +352,24 @@ func newMailer(opt options) (Mailer, error) {
 		if err != nil {
 			return nil, err
 		}
+		serverName, serverNameSource, serverNameErr := resolveSMTPServerName(opt)
+		debugf(
+			opt.debug,
+			"mailer backend=smtp addr=%s security=%s from=%s username=%s username_source=%s password_set=%t password_source=%s server_name=%q server_name_source=%s server_name_error=%q insecure_skip_verify=%t ca_cert=%t client_cert=%t",
+			opt.smtpAddr,
+			strings.ToLower(opt.smtpSecurity),
+			resolved.From,
+			resolved.Username,
+			resolved.UsernameSource,
+			resolved.Password != "",
+			resolved.PasswordSource,
+			serverName,
+			serverNameSource,
+			errString(serverNameErr),
+			opt.smtpInsecureTLS,
+			opt.smtpCACert != "",
+			opt.smtpClientCert != "",
+		)
 
 		return SMTPMailer{
 			Config: SMTPConfig{
@@ -381,4 +435,22 @@ func resolveSMTPConfig(opt options) (smtpResolvedConfig, error) {
 		UsernameSource: usernameSource,
 		PasswordSource: passwordSource,
 	}, nil
+}
+
+func resolveSMTPServerName(opt options) (name string, source string, err error) {
+	if opt.smtpServerName != "" {
+		return opt.smtpServerName, "explicit (-smtp-server-name)", nil
+	}
+	host, _, err := net.SplitHostPort(opt.smtpAddr)
+	if err != nil {
+		return "", "", fmt.Errorf("infer from -smtp-addr %q: %w", opt.smtpAddr, err)
+	}
+	return host, "inferred from -smtp-addr host", nil
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
